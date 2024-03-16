@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
-	"github.com/xssnick/tonutils-go/address"
-	"github.com/xssnick/tonutils-go/liteclient"
-	"github.com/xssnick/tonutils-go/tlb"
-	"github.com/xssnick/tonutils-go/ton"
 	"log"
+	"regexp"
+	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/ton"
+	"github.com/yzimhao/trading_engine/utils"
+	"xorm.io/xorm"
+	"xorm.io/xorm/names"
 )
 
 // func to get storage map key
@@ -42,7 +49,59 @@ func getNotSeenShards(ctx context.Context, api ton.APIClientWrapped, shard *ton.
 	return ret, nil
 }
 
+type Block struct {
+	Id          int64     `xorm:"pk autoincr bigint"`
+	Block       int64     `xorm:"bigint"`
+	Hash        string    `xorm:"varchar(64)"`
+	Number2     int64     `xorm:"bigint"`
+	AllNumber   string    `xorm:"varchar(64)"`
+	CreatedTime time.Time `xorm:"timestamp created" json:"create_time"`
+}
+
+var database *xorm.Engine
+
+func DatabaseInit(driver, dsn string, show_sql bool, prefix string) (err error) {
+	defer func() {
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	if database == nil {
+		conn, err := xorm.NewEngine(driver, dsn)
+		if err != nil {
+			return err
+		}
+
+		if prefix != "" {
+			tbMapper := names.NewPrefixMapper(names.SnakeMapper{}, prefix)
+			conn.SetTableMapper(tbMapper)
+
+		}
+
+		conn.DatabaseTZ = time.Local
+		conn.TZLocation = time.Local
+
+		if err := conn.Ping(); err != nil {
+			return err
+		}
+
+		if show_sql {
+			conn.ShowSQL(true)
+
+		} else {
+
+		}
+		database = conn
+	}
+	return nil
+}
+
 func main() {
+
+	DatabaseInit("mysql", "root:root@tcp(localhost:3306)/dice?charset=utf8&loc=Local", false, "")
+	database.Sync2(new(Block))
+
 	client := liteclient.NewConnectionPool()
 
 	cfg, err := liteclient.GetConfigFromUrl(context.Background(), "https://ton.org/global.config.json")
@@ -93,72 +152,26 @@ func main() {
 		shardLastSeqno[getShardID(shard)] = shard.SeqNo
 	}
 
+	re := regexp.MustCompile("[0-9]+")
+
 	for {
-		log.Printf("scanning %d master block...\n", master.SeqNo)
+		hash := master.FileHash
+		h1 := base64.StdEncoding.EncodeToString(hash)
+		seq := master.SeqNo
+		numbers := re.FindAllString(string(h1), -1)
 
-		// getting information about other work-chains and shards of master block
-		currentShards, err := api.GetBlockShardsInfo(ctx, master)
-		if err != nil {
-			log.Fatalln("get shards err:", err.Error())
-			return
+		data := Block{
+			Hash:      h1,
+			Block:     int64(seq),
+			AllNumber: strings.Join(numbers, ""),
+			Number2: func() int64 {
+				a := utils.S2Int64(strings.Join(numbers, ""))
+				return a % 100
+			}(),
 		}
 
-		// shards in master block may have holes, e.g. shard seqno 2756461, then 2756463, and no 2756462 in master chain
-		// thus we need to scan a bit back in case of discovering a hole, till last seen, to fill the misses.
-		var newShards []*ton.BlockIDExt
-		for _, shard := range currentShards {
-			notSeen, err := getNotSeenShards(ctx, api, shard, shardLastSeqno)
-			if err != nil {
-				log.Fatalln("get not seen shards err:", err.Error())
-				return
-			}
-			shardLastSeqno[getShardID(shard)] = shard.SeqNo
-			newShards = append(newShards, notSeen...)
-		}
-		newShards = append(newShards, master)
-
-		var txList []*tlb.Transaction
-
-		// for each shard block getting transactions
-		for _, shard := range newShards {
-			log.Printf("scanning block %d of shard %x in workchain %d...", shard.SeqNo, uint64(shard.Shard), shard.Workchain)
-
-			var fetchedIDs []ton.TransactionShortInfo
-			var after *ton.TransactionID3
-			var more = true
-
-			// load all transactions in batches with 100 transactions in each while exists
-			for more {
-				fetchedIDs, more, err = api.WaitForBlock(master.SeqNo).GetBlockTransactionsV2(ctx, shard, 100, after)
-				if err != nil {
-					log.Fatalln("get tx ids err:", err.Error())
-					return
-				}
-
-				if more {
-					// set load offset for next query (pagination)
-					after = fetchedIDs[len(fetchedIDs)-1].ID3()
-				}
-
-				for _, id := range fetchedIDs {
-					// get full transaction by id
-					tx, err := api.GetTransaction(ctx, shard, address.NewAddress(0, byte(shard.Workchain), id.Account), id.LT)
-					if err != nil {
-						log.Fatalln("get tx data err:", err.Error())
-						return
-					}
-					txList = append(txList, tx)
-				}
-			}
-		}
-
-		for i, transaction := range txList {
-			log.Println(i, transaction.String())
-		}
-
-		if len(txList) == 0 {
-			log.Printf("no transactions in %d block\n", master.SeqNo)
-		}
+		database.Insert(&data)
+		log.Printf("block %d %s number: %s dice: %2d", seq, h1, data.AllNumber, data.Number2)
 
 		master, err = api.WaitForBlock(master.SeqNo + 1).GetMasterchainInfo(ctx)
 		if err != nil {

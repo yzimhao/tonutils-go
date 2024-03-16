@@ -1,0 +1,2 @@
+
+select (COUNT(CASE WHEN number2 > 50 THEN 1 END) / COUNT(*)) * 100, (COUNT(CASE WHEN number2 <= 50 THEN 1 END) / COUNT(*)) * 100 from block;
